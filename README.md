@@ -1,5 +1,9 @@
 # common-pay
 
+[![CI](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml/badge.svg)](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/siulau1995/common-pay)](https://github.com/siulau1995/common-pay/releases)
+[![License](https://img.shields.io/github/license/siulau1995/common-pay)](LICENSE)
+
 [English](README.md) | [中文](README.zh-CN.md)
 
 `common-pay` is a reusable Spring Boot payment module providing payment orders, refunds, asynchronous callbacks, status history, and scheduled reconciliation. It includes an Alipay adapter and extension points for WeChat Pay or other providers.
@@ -26,7 +30,7 @@ mvn clean install
 <dependency>
     <groupId>io.github.commonpay</groupId>
     <artifactId>common-pay</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 

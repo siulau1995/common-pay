@@ -1,5 +1,9 @@
 # common-pay
 
+[![CI](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml/badge.svg)](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/siulau1995/common-pay)](https://github.com/siulau1995/common-pay/releases)
+[![License](https://img.shields.io/github/license/siulau1995/common-pay)](LICENSE)
+
 [English](README.md) | [中文](README.zh-CN.md)
 
 `common-pay` 是一个可嵌入 Spring Boot 应用的通用支付模块，提供支付订单、退款、异步回调、状态流水与定时对账能力。当前内置支付宝适配器，并保留微信及其他渠道的扩展接口。
@@ -26,7 +30,7 @@ mvn clean install
 <dependency>
     <groupId>io.github.commonpay</groupId>
     <artifactId>common-pay</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 
