@@ -26,5 +26,8 @@ jobs:
           java-version: '8'
           cache: maven
 
-      - name: Verify
-        run: mvn --batch-mode --no-transfer-progress clean verify
+      - name: Verify and install library
+        run: mvn --batch-mode --no-transfer-progress clean install
+
+      - name: Build runnable demo
+        run: mvn --batch-mode --no-transfer-progress -f examples/spring-boot-demo/pom.xml clean package

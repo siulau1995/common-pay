@@ -8,6 +8,8 @@ import java.util.List;
 @Data
 public class PayRefundRequest {
     private String payOrderNo;
+    /** Optional idempotency key. Reusing it returns the existing refund for the same payment order. */
+    private String refundNo;
     private String bizType;
     private String refTable;
     private String refValue;

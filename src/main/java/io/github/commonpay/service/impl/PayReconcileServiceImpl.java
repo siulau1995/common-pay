@@ -1,12 +1,13 @@
 package io.github.commonpay.service.impl;
 
-import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson2.JSON;
 import org.springframework.transaction.annotation.Transactional;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import io.github.commonpay.channel.PayChannelAdapter;
 import io.github.commonpay.channel.PayChannelRegistry;
 import io.github.commonpay.entity.BasePayEntity;
+import io.github.commonpay.entity.PayChannelConfigEntity;
 import io.github.commonpay.entity.PayNotifyRecordEntity;
 import io.github.commonpay.entity.PayOrderEntity;
 import io.github.commonpay.entity.PayOrderItemEntity;
@@ -21,6 +22,7 @@ import io.github.commonpay.enums.PayOrderStatusEnum;
 import io.github.commonpay.enums.PayRefundStatusEnum;
 import io.github.commonpay.enums.PayTradeTypeEnum;
 import io.github.commonpay.mapper.PayNotifyRecordMapper;
+import io.github.commonpay.mapper.PayChannelConfigMapper;
 import io.github.commonpay.mapper.PayOrderItemMapper;
 import io.github.commonpay.mapper.PayOrderMapper;
 import io.github.commonpay.mapper.PayRefundOrderMapper;
@@ -36,9 +38,11 @@ import io.github.commonpay.model.RefundSuccessContext;
 import io.github.commonpay.service.PayBusinessHandler;
 import io.github.commonpay.service.PayReconcileService;
 import io.github.commonpay.util.PayIdGenerator;
+import io.github.commonpay.util.PayRedisLock;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -50,8 +54,12 @@ import java.util.List;
 @Service
 public class PayReconcileServiceImpl implements PayReconcileService {
 
+    private static final long RECONCILE_LOCK_SECONDS = 60L;
+
     @Autowired
     private PayOrderMapper payOrderMapper;
+    @Autowired
+    private PayChannelConfigMapper payChannelConfigMapper;
     @Autowired
     private PayOrderItemMapper payOrderItemMapper;
     @Autowired
@@ -64,11 +72,14 @@ public class PayReconcileServiceImpl implements PayReconcileService {
     private PayTransactionMapper payTransactionMapper;
     @Autowired
     private PayChannelRegistry payChannelRegistry;
+    @Autowired
+    private PayRedisLock payRedisLock;
+    @Autowired
+    private TransactionTemplate transactionTemplate;
     @Autowired(required = false)
     private List<PayBusinessHandler> payBusinessHandlers = new ArrayList<>();
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public int reconcilePayOrders(int batchSize) {
         List<PayOrderEntity> orders = payOrderMapper.selectPage(new Page<>(1, normalizeBatchSize(batchSize)), new LambdaQueryWrapper<PayOrderEntity>()
                 .in(PayOrderEntity::getOrderStatus, Arrays.asList(
@@ -80,28 +91,26 @@ public class PayReconcileServiceImpl implements PayReconcileService {
                 .orderByAsc(PayOrderEntity::getCreatorTime)).getRecords();
         int count = 0;
         for (PayOrderEntity order : orders) {
+            String lockName = orderLockName(order.getPayOrderNo());
+            String lockValue = payRedisLock.lock(lockName, RECONCILE_LOCK_SECONDS);
+            if (lockValue == null) {
+                continue;
+            }
             try {
-                if (expireIfNeeded(order)) {
-                    count++;
-                    continue;
-                }
-                PayChannelResult result = queryOrder(order);
-                saveTransaction(order, PayTradeTypeEnum.QUERY.name(), result.isSuccess() ? PayHandleStatusEnum.SUCCESS.name() : PayHandleStatusEnum.FAILED.name(), null, null, result.getRawResponse(), result.getErrorCode(), result.getErrorMessage());
-                if (!result.isSuccess() || result.getOrderStatus() == null) {
-                    continue;
-                }
-                if (applyOrderStatus(order, result)) {
+                Boolean changed = transactionTemplate.execute(status -> reconcilePayOrder(order.getPayOrderNo()));
+                if (Boolean.TRUE.equals(changed)) {
                     count++;
                 }
             } catch (Exception e) {
                 log.error("支付订单对账失败，payOrderNo={}", order.getPayOrderNo(), e);
+            } finally {
+                payRedisLock.unlock(lockName, lockValue);
             }
         }
         return count;
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public int reconcileRefundOrders(int batchSize) {
         List<PayRefundOrderEntity> refunds = payRefundOrderMapper.selectPage(new Page<>(1, normalizeBatchSize(batchSize)), new LambdaQueryWrapper<PayRefundOrderEntity>()
                 .in(PayRefundOrderEntity::getRefundStatus, Arrays.asList(
@@ -112,21 +121,49 @@ public class PayReconcileServiceImpl implements PayReconcileService {
                 .orderByAsc(PayRefundOrderEntity::getCreatorTime)).getRecords();
         int count = 0;
         for (PayRefundOrderEntity refund : refunds) {
+            String lockName = refundLockName(refund.getRefundNo());
+            String lockValue = payRedisLock.lock(lockName, RECONCILE_LOCK_SECONDS);
+            if (lockValue == null) {
+                continue;
+            }
             try {
-                PayChannelResult result = queryRefund(refund);
-                PayOrderEntity order = getOrderByNo(refund.getPayOrderNo());
-                saveTransaction(order, PayTradeTypeEnum.REFUND_QUERY.name(), result.isSuccess() ? PayHandleStatusEnum.SUCCESS.name() : PayHandleStatusEnum.FAILED.name(), refund.getRefundAmount(), null, result.getRawResponse(), result.getErrorCode(), result.getErrorMessage());
-                if (!result.isSuccess() || result.getRefundStatus() == null) {
-                    continue;
-                }
-                if (applyRefundStatus(refund, order, result)) {
+                Boolean changed = transactionTemplate.execute(status -> reconcileRefundOrder(refund.getRefundNo()));
+                if (Boolean.TRUE.equals(changed)) {
                     count++;
                 }
             } catch (Exception e) {
                 log.error("退款单对账失败，refundNo={}", refund.getRefundNo(), e);
+            } finally {
+                payRedisLock.unlock(lockName, lockValue);
             }
         }
         return count;
+    }
+
+    private boolean reconcilePayOrder(String payOrderNo) {
+        // Re-read after acquiring the same order lock used by callbacks so stale scan rows cannot overwrite a late callback.
+        PayOrderEntity order = getOrderByNo(payOrderNo);
+        if (order.getOrderStatus() == null || PayOrderStatusEnum.valueOf(order.getOrderStatus()).isTerminal()) {
+            return false;
+        }
+        if (expireIfNeeded(order)) {
+            return true;
+        }
+        PayChannelResult result = queryOrder(order);
+        saveTransaction(order, PayTradeTypeEnum.QUERY.name(), result.isSuccess() ? PayHandleStatusEnum.SUCCESS.name() : PayHandleStatusEnum.FAILED.name(), null, null, result.getRawResponse(), result.getErrorCode(), result.getErrorMessage());
+        return result.isSuccess() && result.getOrderStatus() != null && applyOrderStatus(order, result);
+    }
+
+    private boolean reconcileRefundOrder(String refundNo) {
+        // Refund callbacks and reconciliation share a refund lock, preventing the refunded amount from being accumulated twice.
+        PayRefundOrderEntity refund = getRefundByNo(refundNo);
+        if (refund.getRefundStatus() == null || PayRefundStatusEnum.valueOf(refund.getRefundStatus()).isTerminal()) {
+            return false;
+        }
+        PayChannelResult result = queryRefund(refund);
+        PayOrderEntity order = getOrderByNo(refund.getPayOrderNo());
+        saveTransaction(order, PayTradeTypeEnum.REFUND_QUERY.name(), result.isSuccess() ? PayHandleStatusEnum.SUCCESS.name() : PayHandleStatusEnum.FAILED.name(), refund.getRefundAmount(), null, result.getRawResponse(), result.getErrorCode(), result.getErrorMessage());
+        return result.isSuccess() && result.getRefundStatus() != null && applyRefundStatus(refund, order, result);
     }
 
     @Override
@@ -162,21 +199,35 @@ public class PayReconcileServiceImpl implements PayReconcileService {
     }
 
     private PayChannelResult queryOrder(PayOrderEntity order) {
-        PayChannelAdapter adapter = payChannelRegistry.get(PayChannelCodeEnum.valueOf(order.getChannelCode()));
+        PayChannelCodeEnum channelCode = PayChannelCodeEnum.valueOf(order.getChannelCode());
+        PayChannelAdapter adapter = payChannelRegistry.get(channelCode);
         PayChannelRequest request = new PayChannelRequest();
         request.setPayAppCode(order.getPayAppCode());
         request.setOrder(order);
+        request.setChannelConfig(getEnabledChannelConfig(order.getPayAppCode(), channelCode));
         return adapter.query(request);
     }
 
     private PayChannelResult queryRefund(PayRefundOrderEntity refund) {
-        PayChannelAdapter adapter = payChannelRegistry.get(PayChannelCodeEnum.valueOf(refund.getChannelCode()));
+        PayChannelCodeEnum channelCode = PayChannelCodeEnum.valueOf(refund.getChannelCode());
+        PayChannelAdapter adapter = payChannelRegistry.get(channelCode);
         PayOrderEntity order = getOrderByNo(refund.getPayOrderNo());
         PayChannelRequest request = new PayChannelRequest();
         request.setPayAppCode(order.getPayAppCode());
         request.setRefundOrder(refund);
         request.setOrder(order);
+        request.setChannelConfig(getEnabledChannelConfig(order.getPayAppCode(), channelCode));
         return adapter.queryRefund(request);
+    }
+
+    private PayChannelConfigEntity getEnabledChannelConfig(String payAppCode, PayChannelCodeEnum channelCode) {
+        return payChannelConfigMapper.selectOne(new LambdaQueryWrapper<PayChannelConfigEntity>()
+                .eq(PayChannelConfigEntity::getPayAppCode, payAppCode)
+                .eq(PayChannelConfigEntity::getChannelCode, channelCode.name())
+                .eq(PayChannelConfigEntity::getEnabledMark, 1)
+                .eq(PayChannelConfigEntity::getDeleteMark, 0)
+                .orderByAsc(PayChannelConfigEntity::getSortCode)
+                .last("limit 1"));
     }
 
     private boolean expireIfNeeded(PayOrderEntity order) {

@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
+import lombok.ToString;
 
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -35,6 +36,7 @@ public class PayChannelConfigEntity extends BasePayEntity {
     private String refundNotifyUrl;
 
     @TableField("F_Config_Json")
+    @ToString.Exclude
     private String configJson;
 
     @TableField("F_Enabled_Mark")

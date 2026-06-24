@@ -4,6 +4,7 @@ import io.github.commonpay.entity.PayOrderEntity;
 import io.github.commonpay.entity.PayRefundOrderEntity;
 import io.github.commonpay.entity.PayChannelConfigEntity;
 import lombok.Data;
+import lombok.ToString;
 
 import java.util.List;
 import java.util.Map;
@@ -12,6 +13,7 @@ import java.util.Map;
 public class PayChannelRequest {
     private String tenantId;
     private String payAppCode;
+    @ToString.Exclude
     private PayChannelConfigEntity channelConfig;
     private PayOrderEntity order;
     private List<PayCreateItemRequest> items;

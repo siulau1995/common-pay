@@ -1,7 +1,7 @@
 package io.github.commonpay.channel.impl;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
 import com.alipay.api.AlipayApiException;
 import com.alipay.api.AlipayClient;
 import com.alipay.api.AlipayResponse;
@@ -268,7 +268,7 @@ public class AlipayPayChannelAdapter extends AbstractPayChannelAdapter {
         JSONObject bizContent = new JSONObject();
         bizContent.put("out_trade_no", order.getPayOrderNo());
         bizContent.put("total_amount", centToYuan(order.getTotalAmount()));
-        bizContent.put("subject", trimLength(firstNonBlank(order.getSubject(), "能源账单支付"), 256));
+        bizContent.put("subject", trimLength(firstNonBlank(order.getSubject(), "Payment order"), 256));
         if (!isBlank(order.getBody())) {
             bizContent.put("body", trimLength(order.getBody(), 128));
         }
@@ -311,7 +311,17 @@ public class AlipayPayChannelAdapter extends AbstractPayChannelAdapter {
             if (isBlank(alipayPublicKey)) {
                 return false;
             }
-            return AlipaySignature.rsaCheckV1(request.getParams(), alipayPublicKey, charset, signType);
+            if (!AlipaySignature.rsaCheckV1(request.getParams(), alipayPublicKey, charset, signType)) {
+                return false;
+            }
+            String configuredAppId = firstNonBlank(config.getAppId(), configJson.getString("appId"));
+            String callbackAppId = request.getParams().get("app_id");
+            if (!isBlank(configuredAppId) && !configuredAppId.equals(callbackAppId)) {
+                return false;
+            }
+            String configuredMerchantId = firstNonBlank(config.getMerchantId(), configJson.getString("merchantId"));
+            String callbackSellerId = request.getParams().get("seller_id");
+            return isBlank(configuredMerchantId) || configuredMerchantId.equals(callbackSellerId);
         } catch (Exception e) {
             return false;
         }

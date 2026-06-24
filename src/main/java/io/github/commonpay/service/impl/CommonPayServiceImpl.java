@@ -1,7 +1,6 @@
 package io.github.commonpay.service.impl;
 
-import com.alibaba.fastjson.JSON;
-import org.springframework.transaction.annotation.Transactional;
+import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import io.github.commonpay.channel.PayChannelAdapter;
 import io.github.commonpay.channel.PayChannelRegistry;
@@ -52,6 +51,7 @@ import io.github.commonpay.util.PayIdGenerator;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -67,6 +67,7 @@ public class CommonPayServiceImpl implements CommonPayService {
     private static final String DEFAULT_CURRENCY = "CNY";
     private static final int DEFAULT_EXPIRE_MINUTES = 30;
     private static final long NOTIFY_LOCK_SECONDS = 30L;
+    private static final long STATE_CHANGE_LOCK_SECONDS = 60L;
     private static final String DEFAULT_PAY_APP_CODE = "DEFAULT_PAY";
 
     @Autowired
@@ -89,14 +90,25 @@ public class CommonPayServiceImpl implements CommonPayService {
     private PayChannelRegistry payChannelRegistry;
     @Autowired
     private PayRedisLock payRedisLock;
+    @Autowired
+    private TransactionTemplate transactionTemplate;
     @Autowired(required = false)
     private List<PayBusinessHandler> payBusinessHandlers = new ArrayList<>();
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public PayCreateResult createPayOrder(PayCreateRequest request) {
         validateCreateRequest(request);
         request.setPayAppCode(normalizePayAppCode(request.getPayAppCode()));
+        String lockName = businessLockName(request.getBizType(), request.getRefTable(), request.getRefValue());
+        String lockValue = requireLock(lockName, STATE_CHANGE_LOCK_SECONDS);
+        try {
+            return transactionTemplate.execute(status -> createPayOrderInTransaction(request));
+        } finally {
+            payRedisLock.unlock(lockName, lockValue);
+        }
+    }
+
+    private PayCreateResult createPayOrderInTransaction(PayCreateRequest request) {
         expireOldActiveOrder(request);
 
         PayOrderEntity order = buildPayOrder(request);
@@ -128,11 +140,20 @@ public class CommonPayServiceImpl implements CommonPayService {
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public PayOrderEntity closePayOrder(PayCloseRequest request) {
         if (request == null || isBlank(request.getPayOrderNo()) || request.getChannelCode() == null) {
             throw new PayException("关单参数不完整");
         }
+        String lockName = orderLockName(request.getPayOrderNo());
+        String lockValue = requireLock(lockName, STATE_CHANGE_LOCK_SECONDS);
+        try {
+            return transactionTemplate.execute(status -> closePayOrderInTransaction(request));
+        } finally {
+            payRedisLock.unlock(lockName, lockValue);
+        }
+    }
+
+    private PayOrderEntity closePayOrderInTransaction(PayCloseRequest request) {
         PayOrderEntity order = getOrderByNo(request.getPayOrderNo());
         if (PayOrderStatusEnum.PAID.name().equals(order.getOrderStatus())) {
             throw new PayException("已支付订单不能关闭");
@@ -141,6 +162,9 @@ public class CommonPayServiceImpl implements CommonPayService {
         String payAppCode = normalizePayAppCode(request.getPayAppCode());
         PayChannelConfigEntity channelConfig = getEnabledChannelConfig(payAppCode, request.getChannelCode());
         PayChannelResult result = adapter.close(buildChannelRequest(null, payAppCode, channelConfig, order, null, null));
+        if (result == null || !result.isSuccess()) {
+            throw new PayException("支付渠道关单失败：" + (result == null ? "empty response" : result.getErrorMessage()));
+        }
         String beforeStatus = order.getOrderStatus();
         order.setOrderStatus(PayOrderStatusEnum.CLOSED.name());
         order.setCloseTime(new Date());
@@ -154,9 +178,27 @@ public class CommonPayServiceImpl implements CommonPayService {
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public PayRefundOrderEntity createRefund(PayRefundRequest request) {
         validateRefundRequest(request);
+        String lockName = orderLockName(request.getPayOrderNo());
+        String lockValue = requireLock(lockName, STATE_CHANGE_LOCK_SECONDS);
+        try {
+            return transactionTemplate.execute(status -> createRefundInTransaction(request));
+        } finally {
+            payRedisLock.unlock(lockName, lockValue);
+        }
+    }
+
+    private PayRefundOrderEntity createRefundInTransaction(PayRefundRequest request) {
+        if (!isBlank(request.getRefundNo())) {
+            PayRefundOrderEntity existing = findRefundByNo(request.getRefundNo());
+            if (existing != null) {
+                if (!request.getPayOrderNo().equals(existing.getPayOrderNo())) {
+                    throw new PayException("退款幂等号已被其他支付订单使用");
+                }
+                return existing;
+            }
+        }
         PayOrderEntity order = getOrderByNo(request.getPayOrderNo());
         if (!PayOrderStatusEnum.PAID.name().equals(order.getOrderStatus()) && !PayOrderStatusEnum.PARTIAL_REFUND.name().equals(order.getOrderStatus())) {
             throw new PayException("当前订单状态不允许退款");
@@ -184,6 +226,9 @@ public class CommonPayServiceImpl implements CommonPayService {
         PayChannelRequest channelRequest = buildChannelRequest(null, payAppCode, channelConfig, order, null, null);
         channelRequest.setRefundOrder(refundOrder);
         PayChannelResult result = adapter.refund(channelRequest);
+        if (result == null || !result.isSuccess()) {
+            throw new PayException("支付渠道退款申请失败：" + (result == null ? "empty response" : result.getErrorMessage()));
+        }
         saveTransaction(order, PayTradeTypeEnum.REFUND.name(), result.isSuccess() ? PayHandleStatusEnum.SUCCESS.name() : PayHandleStatusEnum.FAILED.name(), request.getRefundAmount(), JSON.toJSONString(request), result.getRawResponse(), result.getErrorCode(), result.getErrorMessage());
         return refundOrder;
     }
@@ -217,13 +262,13 @@ public class CommonPayServiceImpl implements CommonPayService {
         if (isBlank(message.getPayOrderNo())) {
             return adapter.buildPayNotifyFailResponse("pay order no empty");
         }
-        String lockName = "pay:notify:" + tenantId + ":" + channelCode.name() + ":" + message.getPayOrderNo();
+        String lockName = orderLockName(message.getPayOrderNo());
         String lockValue = payRedisLock.lock(lockName, NOTIFY_LOCK_SECONDS);
         if (lockValue == null) {
             return adapter.buildPayNotifyFailResponse("notify processing");
         }
         try {
-            return handlePayNotifyLocked(adapter, channelCode, message);
+            return transactionTemplate.execute(status -> handlePayNotifyLocked(adapter, channelCode, message));
         } finally {
             payRedisLock.unlock(lockName, lockValue);
         }
@@ -250,24 +295,38 @@ public class CommonPayServiceImpl implements CommonPayService {
         if (isBlank(message.getRefundNo())) {
             return adapter.buildRefundNotifyFailResponse("refund no empty");
         }
-        String lockName = "pay:refund_notify:" + tenantId + ":" + channelCode.name() + ":" + message.getRefundNo();
+        String lockName = refundLockName(message.getRefundNo());
         String lockValue = payRedisLock.lock(lockName, NOTIFY_LOCK_SECONDS);
         if (lockValue == null) {
             return adapter.buildRefundNotifyFailResponse("refund notify processing");
         }
         try {
-            return handleRefundNotifyLocked(adapter, channelCode, message);
+            return transactionTemplate.execute(status -> handleRefundNotifyLocked(adapter, channelCode, message));
         } finally {
             payRedisLock.unlock(lockName, lockValue);
         }
     }
 
-    @Transactional(rollbackFor = Exception.class)
     public String handlePayNotifyLocked(PayChannelAdapter adapter, PayChannelCodeEnum channelCode, PayNotifyMessage message) {
-        PayNotifyRecordEntity record = buildNotifyRecord(channelCode, PayNotifyTypeEnum.PAY.name(), message);
-        payNotifyRecordMapper.insert(record);
+        PayNotifyRecordEntity record = findNotifyRecord(channelCode, PayNotifyTypeEnum.PAY.name(), message.getChannelNotifyId());
+        if (record != null && PayHandleStatusEnum.SUCCESS.name().equals(record.getNotifyStatus())) {
+            // A provider may retry the same signed notification after receiving a slow response.
+            // The state transition already completed, so acknowledge it without inserting a duplicate row.
+            return message.isVerifySuccess()
+                    ? adapter.buildPayNotifySuccessResponse()
+                    : adapter.buildPayNotifyFailResponse("验签失败");
+        }
+        if (record == null) {
+            record = buildNotifyRecord(channelCode, PayNotifyTypeEnum.PAY.name(), message);
+            payNotifyRecordMapper.insert(record);
+        } else {
+            refreshNotifyRecord(record, message);
+        }
         try {
             PayOrderEntity order = getOrderByNo(message.getPayOrderNo());
+            if (!channelCode.name().equals(order.getChannelCode())) {
+                return failPayNotify(adapter, record, "支付渠道与订单不匹配");
+            }
             if (!message.isVerifySuccess()) {
                 return failPayNotify(adapter, record, "验签失败");
             }
@@ -306,12 +365,25 @@ public class CommonPayServiceImpl implements CommonPayService {
         }
     }
 
-    @Transactional(rollbackFor = Exception.class)
     public String handleRefundNotifyLocked(PayChannelAdapter adapter, PayChannelCodeEnum channelCode, PayNotifyMessage message) {
-        PayNotifyRecordEntity record = buildNotifyRecord(channelCode, PayNotifyTypeEnum.REFUND.name(), message);
-        payNotifyRecordMapper.insert(record);
+        PayNotifyRecordEntity record = findNotifyRecord(channelCode, PayNotifyTypeEnum.REFUND.name(), message.getChannelNotifyId());
+        if (record != null && PayHandleStatusEnum.SUCCESS.name().equals(record.getNotifyStatus())) {
+            // A successful refund notification is idempotent for the same provider notification id.
+            return message.isVerifySuccess()
+                    ? adapter.buildRefundNotifySuccessResponse()
+                    : adapter.buildRefundNotifyFailResponse("验签失败");
+        }
+        if (record == null) {
+            record = buildNotifyRecord(channelCode, PayNotifyTypeEnum.REFUND.name(), message);
+            payNotifyRecordMapper.insert(record);
+        } else {
+            refreshNotifyRecord(record, message);
+        }
         try {
             PayRefundOrderEntity refundOrder = getRefundByNo(message.getRefundNo());
+            if (!channelCode.name().equals(refundOrder.getChannelCode())) {
+                return failRefundNotify(adapter, record, "退款渠道与退款单不匹配");
+            }
             if (!message.isVerifySuccess()) {
                 return failRefundNotify(adapter, record, "验签失败");
             }
@@ -392,6 +464,18 @@ public class CommonPayServiceImpl implements CommonPayService {
         if (request.getRefundAmount() == null || request.getRefundAmount() <= 0) {
             throw new PayException("退款金额必须大于0");
         }
+        if (request.getItems() != null && !request.getItems().isEmpty()) {
+            long itemAmount = 0L;
+            for (PayRefundItemRequest item : request.getItems()) {
+                if (item == null || item.getRefundAmount() == null || item.getRefundAmount() <= 0) {
+                    throw new PayException("退款明细金额必须大于0");
+                }
+                itemAmount = Math.addExact(itemAmount, item.getRefundAmount());
+            }
+            if (itemAmount != request.getRefundAmount()) {
+                throw new PayException("退款明细金额合计必须等于退款总金额");
+            }
+        }
     }
 
     private PayOrderEntity buildPayOrder(PayCreateRequest request) {
@@ -441,7 +525,7 @@ public class CommonPayServiceImpl implements CommonPayService {
     private PayRefundOrderEntity buildRefundOrder(PayOrderEntity order, PayRefundRequest request) {
         PayRefundOrderEntity refundOrder = new PayRefundOrderEntity();
         fillCreate(refundOrder, new Date());
-        refundOrder.setRefundNo(generateNo("RFD"));
+        refundOrder.setRefundNo(isBlank(request.getRefundNo()) ? generateNo("RFD") : request.getRefundNo().trim());
         refundOrder.setPayOrderId(order.getId());
         refundOrder.setPayOrderNo(order.getPayOrderNo());
         refundOrder.setBizType(request.getBizType());
@@ -597,6 +681,19 @@ public class CommonPayServiceImpl implements CommonPayService {
         return refunds.get(0);
     }
 
+    private PayRefundOrderEntity findRefundByNo(String refundNo) {
+        List<PayRefundOrderEntity> refunds = payRefundOrderMapper.selectList(new LambdaQueryWrapper<PayRefundOrderEntity>()
+                .eq(PayRefundOrderEntity::getRefundNo, refundNo)
+                .eq(PayRefundOrderEntity::getDeleteMark, 0));
+        if (refunds == null || refunds.isEmpty()) {
+            return null;
+        }
+        if (refunds.size() > 1) {
+            throw new PayException("退款单号重复，请检查数据");
+        }
+        return refunds.get(0);
+    }
+
     private void updateItemsStatus(String payOrderId, String status, Long paidAmount) {
         List<PayOrderItemEntity> items = payOrderItemMapper.selectList(new LambdaQueryWrapper<PayOrderItemEntity>()
                 .eq(PayOrderItemEntity::getPayOrderId, payOrderId)
@@ -639,6 +736,39 @@ public class CommonPayServiceImpl implements CommonPayService {
         record.setNotifyTime(message.getNotifyTime() == null ? new Date() : message.getNotifyTime());
         record.setRetryCount(0);
         return record;
+    }
+
+    private PayNotifyRecordEntity findNotifyRecord(PayChannelCodeEnum channelCode, String notifyType, String channelNotifyId) {
+        if (isBlank(channelNotifyId)) {
+            return null;
+        }
+        List<PayNotifyRecordEntity> records = payNotifyRecordMapper.selectList(new LambdaQueryWrapper<PayNotifyRecordEntity>()
+                .eq(PayNotifyRecordEntity::getChannelCode, channelCode.name())
+                .eq(PayNotifyRecordEntity::getChannelNotifyId, channelNotifyId)
+                .eq(PayNotifyRecordEntity::getDeleteMark, 0));
+        if (records == null || records.isEmpty()) {
+            return null;
+        }
+        PayNotifyRecordEntity record = records.get(0);
+        if (!notifyType.equals(record.getNotifyType())) {
+            throw new PayException("渠道通知号已被其他通知类型使用");
+        }
+        return record;
+    }
+
+    private void refreshNotifyRecord(PayNotifyRecordEntity record, PayNotifyMessage message) {
+        record.setPayOrderNo(message.getPayOrderNo());
+        record.setRefundNo(message.getRefundNo());
+        record.setChannelTradeNo(message.getChannelTradeNo());
+        record.setNotifyStatus(PayHandleStatusEnum.RECEIVED.name());
+        record.setVerifyStatus(message.isVerifySuccess() ? PayVerifyStatusEnum.SUCCESS.name() : PayVerifyStatusEnum.FAILED.name());
+        record.setBusinessStatus(PayHandleStatusEnum.RECEIVED.name());
+        record.setNotifyBody(message.getRawBody());
+        record.setNotifyTime(message.getNotifyTime() == null ? new Date() : message.getNotifyTime());
+        record.setErrorMessage(null);
+        record.setResponseBody(null);
+        record.setHandleTime(null);
+        touch(record);
     }
 
     private String successPayNotify(PayChannelAdapter adapter, PayNotifyRecordEntity record, String businessError) {
@@ -851,6 +981,26 @@ public class CommonPayServiceImpl implements CommonPayService {
 
     private String generateNo(String prefix) {
         return prefix + new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()) + PayIdGenerator.nextId();
+    }
+
+    private String requireLock(String lockName, long expireSeconds) {
+        String lockValue = payRedisLock.lock(lockName, expireSeconds);
+        if (lockValue == null) {
+            throw new PayException("支付业务正在处理中，请稍后重试");
+        }
+        return lockValue;
+    }
+
+    private String businessLockName(String bizType, String refTable, String refValue) {
+        return "business:" + bizType + ":" + refTable + ":" + refValue;
+    }
+
+    private String orderLockName(String payOrderNo) {
+        return "order:" + payOrderNo;
+    }
+
+    private String refundLockName(String refundNo) {
+        return "refund:" + refundNo;
     }
 
     private boolean isBlank(String value) {

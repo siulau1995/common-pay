@@ -1,12 +1,13 @@
 package io.github.commonpay.channel.impl;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
 import io.github.commonpay.channel.PayChannelAdapter;
 import io.github.commonpay.model.PayChannelRequest;
 import io.github.commonpay.model.PayChannelResult;
 import io.github.commonpay.model.PayCreateResult;
 import io.github.commonpay.model.PayNotifyMessage;
+import io.github.commonpay.util.PayException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -17,35 +18,27 @@ public abstract class AbstractPayChannelAdapter implements PayChannelAdapter {
 
     @Override
     public PayCreateResult prepay(PayChannelRequest request) {
-        PayCreateResult result = new PayCreateResult();
-        result.setPayOrderNo(request.getOrder().getPayOrderNo());
-        result.setChannelCode(getChannelCode());
-        result.setPayScene(io.github.commonpay.enums.PaySceneEnum.valueOf(request.getOrder().getPayScene()));
-        result.getPayParams().put("payOrderNo", request.getOrder().getPayOrderNo());
-        result.getPayParams().put("channelCode", getChannelCode().name());
-        result.getPayParams().put("payScene", request.getOrder().getPayScene());
-        result.getPayParams().put("message", "渠道 SDK 参数请在适配器中接入");
-        return result;
+        throw unsupported("prepay");
     }
 
     @Override
     public PayChannelResult close(PayChannelRequest request) {
-        return PayChannelResult.success("{}");
+        throw unsupported("close");
     }
 
     @Override
     public PayChannelResult refund(PayChannelRequest request) {
-        return PayChannelResult.success("{}");
+        throw unsupported("refund");
     }
 
     @Override
     public PayChannelResult query(PayChannelRequest request) {
-        return PayChannelResult.success("{}");
+        throw unsupported("query");
     }
 
     @Override
     public PayChannelResult queryRefund(PayChannelRequest request) {
-        return PayChannelResult.success("{}");
+        throw unsupported("queryRefund");
     }
 
     protected PayNotifyMessage buildMessageFromJson(PayChannelRequest request, String orderField, String amountField) {
@@ -59,7 +52,7 @@ public abstract class AbstractPayChannelAdapter implements PayChannelAdapter {
         message.setAmount(jsonAmountToCent(json, amountField));
         message.setNotifyTime(new Date());
         message.setSuccess(true);
-        message.setVerifySuccess(true);
+        message.setVerifySuccess(false);
         message.setRawBody(request.getRawBody());
         return message;
     }
@@ -75,7 +68,7 @@ public abstract class AbstractPayChannelAdapter implements PayChannelAdapter {
         message.setAmount(yuanToCent(params.get(amountField)));
         message.setNotifyTime(new Date());
         message.setSuccess(true);
-        message.setVerifySuccess(true);
+        message.setVerifySuccess(false);
         message.setRawBody(JSON.toJSONString(params));
         return message;
     }
@@ -109,5 +102,9 @@ public abstract class AbstractPayChannelAdapter implements PayChannelAdapter {
                 .setScale(2, RoundingMode.UNNECESSARY)
                 .movePointRight(2)
                 .longValueExact();
+    }
+
+    private PayException unsupported(String operation) {
+        return new PayException("Payment channel " + getChannelCode() + " does not implement " + operation);
     }
 }

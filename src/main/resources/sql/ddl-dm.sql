@@ -210,3 +210,13 @@ CREATE TABLE base_pay_status_record (
     f_extra_json clob,
     PRIMARY KEY (f_id)
 );
+
+CREATE UNIQUE INDEX uk_pay_order_no ON base_pay_order (f_pay_order_no);
+CREATE UNIQUE INDEX uk_pay_transaction_no ON base_pay_transaction (f_transaction_no);
+CREATE UNIQUE INDEX uk_pay_refund_no ON base_pay_refund_order (f_refund_no);
+CREATE UNIQUE INDEX uk_pay_notify_no ON base_pay_notify_record (f_notify_no);
+CREATE UNIQUE INDEX uk_pay_channel_notify ON base_pay_notify_record (f_channel_code, f_channel_notify_id);
+CREATE INDEX idx_pay_order_business ON base_pay_order (f_biz_type, f_ref_table, f_ref_value, f_delete_mark);
+CREATE INDEX idx_pay_order_status ON base_pay_order (f_order_status, f_delete_mark, f_creator_time);
+CREATE INDEX idx_pay_refund_status ON base_pay_refund_order (f_refund_status, f_delete_mark, f_creator_time);
+CREATE INDEX idx_pay_notify_retry ON base_pay_notify_record (f_notify_status, f_business_status, f_retry_count, f_delete_mark);

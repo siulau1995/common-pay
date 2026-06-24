@@ -1,12 +1,13 @@
 # common-pay
 
 [![CI](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml/badge.svg)](https://github.com/siulau1995/common-pay/actions/workflows/ci.yml)
+[![Security](https://github.com/siulau1995/common-pay/actions/workflows/security.yml/badge.svg)](https://github.com/siulau1995/common-pay/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/siulau1995/common-pay)](https://github.com/siulau1995/common-pay/releases)
 [![License](https://img.shields.io/github/license/siulau1995/common-pay)](LICENSE)
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-`common-pay` is a reusable Spring Boot payment module providing payment orders, refunds, asynchronous callbacks, status history, and scheduled reconciliation. It includes an Alipay adapter and extension points for WeChat Pay or other providers.
+`common-pay` is a reusable Spring Boot payment module for payment orders, refunds, asynchronous callbacks, status history, and scheduled reconciliation. It ships with an Alipay adapter and provider extension points for application-specific channels.
 
 ## Features
 
@@ -14,23 +15,47 @@
 - Alipay native QR, desktop web, H5, and app payments
 - Refund creation and refund queries
 - Verified, idempotent payment and refund callbacks
+- Redis-backed state locks and unique provider notification identifiers
 - Status history, provider call records, and failed business callback retry
-- Optional Redis distributed lock and reconciliation jobs
 - Optional tenant datasource switching integration
+- MySQL and Dameng schemas, source JAR, Javadoc JAR, and CycloneDX SBOM
 
 All monetary values are stored in **cents** to avoid floating-point errors.
 
+## Security model
+
+- Provider adapters own signature verification and provider status mapping.
+- A callback must pass signature, channel, and amount validation before it changes an order or refund.
+- Redis serializes state changes. A repeated provider notification is acknowledged without repeating the business transition.
+- Credentials are supplied through channel configuration and excluded from generated `toString()` output.
+- The built-in adapter is **Alipay only**. Other channels must be supplied by the host application through `PayChannelAdapter`; there is no permissive placeholder adapter.
+
+Report vulnerabilities through [SECURITY.md](SECURITY.md). Do not include production credentials or customer data in issues.
+
 ## Install
+
+### Local build
 
 ```bash
 mvn clean install
 ```
 
+### GitHub Packages
+
+Releases are published to GitHub Packages. Configure a GitHub token with `read:packages` in Maven `settings.xml`, then add the repository:
+
 ```xml
+<repositories>
+    <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/siulau1995/common-pay</url>
+    </repository>
+</repositories>
+
 <dependency>
     <groupId>io.github.commonpay</groupId>
     <artifactId>common-pay</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
 </dependency>
 ```
 
@@ -38,6 +63,15 @@ The module is auto-configured through `META-INF/spring.factories`. Database DDL 
 
 - MySQL: `src/main/resources/sql/ddl-mysql.sql`
 - Dameng: `src/main/resources/sql/ddl-dm.sql`
+
+## Runnable demo
+
+[`examples/spring-boot-demo`](examples/spring-boot-demo) starts a synthetic payment provider with H2 and Redis. It creates an order, accepts a deliberately synthetic signed callback, demonstrates replay-safe callback handling, and supports query/refund flows. It contains no real provider credentials.
+
+```bash
+cd examples/spring-boot-demo
+docker compose up --build
+```
 
 ## Minimal configuration
 
@@ -88,22 +122,18 @@ public class ApplicationTenantSwitcher implements PayTenantDataSourceSwitcher {
 }
 ```
 
-## Business callbacks
+## Business callbacks and provider extensions
 
-Implement `PayBusinessHandler` as a Spring bean. The module calls it after payment success, close, expiration, and refund success. Failed success callbacks can be retried by the scheduled job.
-
-## Extending providers
-
-Implement `PayChannelAdapter` and register it as a Spring bean to add a provider. The adapter owns provider API calls, signature verification, and provider status mapping; the module keeps order lifecycle, idempotency, and business callbacks centralized.
+Implement `PayBusinessHandler` as a Spring bean for payment lifecycle integration. Implement `PayChannelAdapter` as a Spring bean to add a provider. The adapter owns provider API calls and signature verification; the module owns order lifecycle, validation, locking, idempotency, and business callbacks.
 
 ## Requirements
 
 - Java 8+
 - Spring Boot 2.7.x
 - MyBatis-Plus 3.5.x
-- Redis for callback locking and clustered reconciliation
+- Redis for distributed callback locking and clustered reconciliation
 - A host-provided `DataSource` and transaction manager
 
-## Before publishing
+## License and notices
 
-This repository removes direct dependencies on the original host platform, including its Maven artifacts, entity and mapper base classes, ID utility, response wrapper, and tenant-switching implementation. The code owner should still review all source provenance, third-party SDK licenses, and the repository license before publishing.
+Licensed under [Apache License 2.0](LICENSE). Direct dependency notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); each release also attaches a CycloneDX SBOM. Contributions are accepted under Apache-2.0 as described in [CONTRIBUTING.md](CONTRIBUTING.md).
