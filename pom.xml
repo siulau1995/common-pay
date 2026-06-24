@@ -29,7 +29,7 @@
     <properties>
         <java.version>8</java.version>
         <spring-boot.version>2.7.18</spring-boot.version>
-        <mybatis-plus.version>3.5.7</mybatis-plus.version>
+        <mybatis-plus.version>3.5.16</mybatis-plus.version>
         <fastjson2.version>2.0.62</fastjson2.version>
         <alipay-sdk.version>4.40.852.ALL</alipay-sdk.version>
         <lombok.version>1.18.32</lombok.version>
